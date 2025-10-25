@@ -5,19 +5,44 @@ import { Pool } from "pg";
 const app = express();
 app.use(express.json());
 
-// 只允許你的前端域名
-app.use(cors({
-  origin: ["https://elainediet.zeabur.app"],
-}));
+/* ---------------- CORS ----------------
+   允許：
+   1) 正式站：https://elainediet.zeabur.app
+   2) 任何 localhost（任意 port）
+   3) 任何 Zeabur 子網域（例如 https://dietapi.zeabur.app）
+--------------------------------------- */
+const allowList = ["https://elainediet.zeabur.app"];
 
-// PG 連線（Zeabur 通常要 SSL）
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true); // 同網域或 Postman/CLI
+      const isAllowed =
+        allowList.includes(origin) ||
+        /^http:\/\/localhost(:\d+)?$/.test(origin) || // localhost 任意埠
+        /^https:\/\/.*\.zeabur\.app$/.test(origin);   // 任何 Zeabur 子網域
+      cb(null, isAllowed);
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type"],
+    credentials: false,
+  })
+);
+
+// 預檢請求
+app.options("*", cors());
+
+/* ---------------- PostgreSQL 連線 ----------------
+   Zeabur PG 通常需要 SSL
+--------------------------------------------------- */
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL
-    || "postgresql://root:8JOLRf5ByMdU0v36Yq1T2F7rEGp9egX4@hnd1.clusters.zeabur.com:25440/zeabur?sslmode=require",
+  connectionString:
+    process.env.DATABASE_URL ||
+    "postgresql://root:8JOLRf5ByMdU0v36Yq1T2F7rEGp9egX4@hnd1.clusters.zeabur.com:25440/zeabur?sslmode=require",
   ssl: { rejectUnauthorized: false },
 });
 
-// 建表（若尚未存在）
+/* ---------------- 建表（若尚未存在） ---------------- */
 await pool.query(`
 CREATE TABLE IF NOT EXISTS meal_records (
   id SERIAL PRIMARY KEY,
@@ -37,17 +62,16 @@ CREATE TABLE IF NOT EXISTS meal_records (
 `);
 console.log("✅ Table meal_records ready!");
 
-// 健康檢查
+/* ---------------- 健康檢查 ---------------- */
 app.get("/", (req, res) => res.send("✅ ElaineDiet API running"));
 
-/** 小工具：把 'yyyy/MM/dd' 或 Date 物件，轉成 'yyyy-MM-dd' */
+/* 小工具：把 'yyyy/MM/dd' 或 Date 物件，轉成 'yyyy-MM-dd'（PG 最穩定） */
 function toIsoDateOnly(input) {
-  // 若是 'yyyy/MM/dd' => 換成 '-'，再丟給 Date
   if (typeof input === "string") {
     const normalized = input.replace(/\//g, "-"); // 2025-10-25
     const d = new Date(normalized);
     if (Number.isNaN(d.getTime())) throw new Error(`Invalid date: ${input}`);
-    return d.toISOString().slice(0, 10); // 'yyyy-MM-dd'
+    return d.toISOString().slice(0, 10);
   }
   if (input instanceof Date) {
     return input.toISOString().slice(0, 10);
@@ -55,18 +79,18 @@ function toIsoDateOnly(input) {
   throw new Error(`Invalid date input: ${input}`);
 }
 
-/** 小工具：把可能是字串的數字安全轉成整數，空值或 NaN -> 0 */
+/* 小工具：把可能是字串的數字安全轉成整數，空值或 NaN -> 0 */
 function toInt(v) {
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? n : 0;
 }
 
-// ➕ 新增一筆紀錄
+/* ---------------- 新增一筆紀錄 ---------------- */
 app.post("/records", async (req, res) => {
   try {
     const {
-      date,              // 可能是 '2025/10/25'
-      meal,              // 'Breakfast' | 'Lunch' | 'Dinner' | 'Snack'
+      date, // '2025/10/25' 或 '2025-10-25'
+      meal, // 'Breakfast' | 'Lunch' | 'Dinner' | 'Snack'
       whole_grains = 0,
       vegetables = 0,
       protein_low = 0,
@@ -82,10 +106,10 @@ app.post("/records", async (req, res) => {
       return res.status(400).json({ error: "date and meal are required" });
     }
 
-    // 1) 日期格式轉成 PG 最穩定的 'yyyy-MM-dd'
+    // 1) 日期格式轉成 PG 穩定格式
     const isoDate = toIsoDateOnly(date);
 
-    // 2) 數字欄位轉整數，避免字串造成型別錯誤
+    // 2) 數字欄位轉整數
     const payload = {
       whole_grains: toInt(whole_grains),
       vegetables: toInt(vegetables),
@@ -123,7 +147,7 @@ app.post("/records", async (req, res) => {
   }
 });
 
-// 📅 每日彙總（?date=yyyy-MM-dd 或 yyyy/MM/dd）
+/* ---------------- 每日彙總（?date=yyyy-MM-dd / yyyy/MM/dd） ---------------- */
 app.get("/summary", async (req, res) => {
   try {
     const { date } = req.query;
@@ -149,5 +173,6 @@ app.get("/summary", async (req, res) => {
   }
 });
 
+/* ---------------- 服務啟動 ---------------- */
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`🚀 ElaineDiet API running on ${port}`));
