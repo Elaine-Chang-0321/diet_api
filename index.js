@@ -147,6 +147,62 @@ app.post("/records", async (req, res) => {
   }
 });
 
+/* ---------------- 依日期查詢當日紀錄（列表） ----------------
+   用法：
+   - GET /records?date=2025-10-25
+   - GET /records?from=2025-10-01&to=2025-10-31   // 區間
+   - 可選：?limit=50&offset=0&order=desc           // 分頁 / 排序
+---------------------------------------------------------------- */
+app.get("/records", async (req, res) => {
+  try {
+    let { date, from, to, limit = "100", offset = "0", order = "desc" } = req.query;
+
+    // 合法化 limit/offset
+    limit = Math.max(0, Math.min(parseInt(limit, 10) || 100, 500));
+    offset = Math.max(0, parseInt(offset, 10) || 0);
+    order = (String(order).toLowerCase() === "asc") ? "ASC" : "DESC";
+
+    const where = [];
+    const params = [];
+
+    // 單日 or 區間擇一
+    if (date) {
+      params.push(toIsoDateOnly(date));
+      where.push(`date = $${params.length}`);
+    } else {
+      if (from) {
+        params.push(toIsoDateOnly(from));
+        where.push(`date >= $${params.length}`);
+      }
+      if (to) {
+        params.push(toIsoDateOnly(to));
+        where.push(`date <= $${params.length}`);
+      }
+    }
+
+    const whereSql = where.length ? `WHERE ${where.join(" AND ")}` : "";
+
+    const sql = `
+      SELECT
+        id, created_at, date, meal,
+        whole_grains, vegetables,
+        protein_low, protein_med, protein_high, protein_xhigh,
+        junk_food, note, image_url
+      FROM meal_records
+      ${whereSql}
+      ORDER BY created_at ${order}
+      LIMIT ${limit} OFFSET ${offset};
+    `;
+
+    const result = await pool.query(sql, params);
+    res.json(result.rows);
+  } catch (e) {
+    console.error("❌ LIST ERROR:", e.message, e.stack);
+    res.status(500).json({ error: "list failed", detail: e.message });
+  }
+});
+
+
 /* ---------------- 每日彙總（?date=yyyy-MM-dd / yyyy/MM/dd） ---------------- */
 app.get("/summary", async (req, res) => {
   try {
