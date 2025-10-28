@@ -1,8 +1,17 @@
 import express from "express";
 import cors from "cors";
 import { Pool } from "pg";
+import multer from "multer";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
+
+/* 讓 JSON 請求可用；multipart 由 multer 處理 */
 app.use(express.json());
 
 /* ---------------- CORS ----------------
@@ -24,13 +33,37 @@ app.use(
       cb(null, isAllowed);
     },
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: ["Content-Type", "Accept"],
     credentials: false,
   })
 );
 
 // 預檢請求
 app.options("*", cors());
+
+/* ---------------- 靜態檔案服務：讓 /uploads 可用網址直接存取 ---------------- */
+const uploadsDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+app.use("/uploads", express.static(uploadsDir));
+
+/* ---------------- multer 設定：限制 5MB，只收圖片 ---------------- */
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, uploadsDir),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const name = `${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`;
+    cb(null, name);
+  },
+});
+const fileFilter = (_req, file, cb) => {
+  const ok = ["image/jpeg", "image/png", "image/webp"].includes(file.mimetype);
+  cb(null, ok);
+};
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: { fileSize: 5 * 1024 * 1024 },
+});
 
 /* ---------------- PostgreSQL 連線 ----------------
    Zeabur PG 通常需要 SSL
@@ -63,7 +96,7 @@ CREATE TABLE IF NOT EXISTS meal_records (
 console.log("✅ Table meal_records ready!");
 
 /* ---------------- 健康檢查 ---------------- */
-app.get("/", (req, res) => res.send("✅ ElaineDiet API running"));
+app.get("/", (_req, res) => res.send("✅ ElaineDiet API running"));
 
 /* 小工具：把 'yyyy/MM/dd' 或 Date 物件，轉成 'yyyy-MM-dd'（PG 最穩定） */
 function toIsoDateOnly(input) {
@@ -85,9 +118,38 @@ function toInt(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
-/* ---------------- 新增一筆紀錄 ---------------- */
-app.post("/records", async (req, res) => {
+/* ---------------- 圖片上傳：先拿到 URL，再用 /records 寫進 DB ----------------
+   前端用 multipart/form-data，欄位名固定為 image
+   回傳：{ url: "https://dietapi.zeabur.app/uploads/<filename>" }
+------------------------------------------------------------------ */
+app.post("/upload-image", upload.single("image"), (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: "no file uploaded" });
+    const url = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+    return res.json({ url });
+  } catch (e) {
+    console.error("❌ UPLOAD ERROR:", e.message, e.stack);
+    return res.status(500).json({ error: "upload failed", detail: e.message });
+  }
+});
+
+/* ---------------- 新增一筆紀錄 ----------------
+   兼容兩種用法：
+   A) JSON：
+      Content-Type: application/json
+      body: { date, meal, ..., image_url: "https://..." }
+
+   B) multipart/form-data：
+      欄位：date, meal, whole_grains...（皆為字串）
+      檔案：image（可選）
+      → 若上傳了 image，會自動把 URL 存進 image_url
+------------------------------------------------------------------ */
+app.post("/records", upload.single("image"), async (req, res) => {
+  try {
+    // 如果是 multipart，欄位在 req.body（皆為 string），檔案在 req.file
+    // 如果是 JSON，欄位在 req.body，req.file 會是 undefined
+    const body = req.body || {};
+
     const {
       date, // '2025/10/25' 或 '2025-10-25'
       meal, // 'Breakfast' | 'Lunch' | 'Dinner' | 'Snack'
@@ -99,11 +161,17 @@ app.post("/records", async (req, res) => {
       protein_xhigh = 0,
       junk_food = 0,
       note = null,
-      image_url = null,
-    } = req.body;
+      image_url: imageUrlFromJson = null,
+    } = body;
 
     if (!date || !meal) {
       return res.status(400).json({ error: "date and meal are required" });
+    }
+
+    // 若 multipart 有檔案，優先用它建立 URL；否則使用 JSON 的 image_url
+    let finalImageUrl = imageUrlFromJson;
+    if (req.file) {
+      finalImageUrl = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
     }
 
     // 1) 日期格式轉成 PG 穩定格式
@@ -136,7 +204,7 @@ app.post("/records", async (req, res) => {
         payload.protein_xhigh,
         payload.junk_food,
         note,
-        image_url,
+        finalImageUrl,
       ]
     );
 
@@ -160,7 +228,7 @@ app.get("/records", async (req, res) => {
     // 合法化 limit/offset
     limit = Math.max(0, Math.min(parseInt(limit, 10) || 100, 500));
     offset = Math.max(0, parseInt(offset, 10) || 0);
-    order = (String(order).toLowerCase() === "asc") ? "ASC" : "DESC";
+    order = String(order).toLowerCase() === "asc" ? "ASC" : "DESC";
 
     const where = [];
     const params = [];
@@ -201,7 +269,6 @@ app.get("/records", async (req, res) => {
     res.status(500).json({ error: "list failed", detail: e.message });
   }
 });
-
 
 /* ---------------- 每日彙總（?date=yyyy-MM-dd / yyyy/MM/dd） ---------------- */
 app.get("/summary", async (req, res) => {
